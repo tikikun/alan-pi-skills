@@ -1,0 +1,13 @@
+{
+  "name": "alan-pi-skills",
+  "version": "1.0.0",
+  "description": "Pi skills for web search and webpage fetching via Puppeteer",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "skills": ["./skills"]
+  },
+  "dependencies": {
+    "puppeteer": "npm:rebrowser-puppeteer@^24.8.1"
+  }
+}
