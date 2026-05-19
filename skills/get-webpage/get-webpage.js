@@ -9,7 +9,8 @@
 import puppeteer from "puppeteer";
 import { homedir } from "os";
 import { join } from "path";
-
+import { existsSync, rmSync, readlinkSync } from "fs";
+import { execSync } from "child_process";
 const DEBUG_PORT  = 9222;
 const PROFILE_DIR = join(homedir(), "Library", "Application Support", "pi-chrome-profile");
 
@@ -19,6 +20,7 @@ if (!argv.length || argv[0] === "-h" || argv[0] === "--help") {
 	console.log("Usage: get-webpage.js <url> [--text-only] [--max-length <chars>]");
 	console.log("  --text-only          Strip all markup, output plain text (default: true)");
 	console.log("  --max-length <n>     Truncate output to n characters (default: 20000)");
+	console.log("  --wait <seconds>     Extra wait for JS-heavy pages");
 	process.exit(0);
 }
 
@@ -41,22 +43,62 @@ if (!url) { console.error("✗ No URL provided"); process.exit(1); }
 // Basic URL validation / auto-prefix
 const resolvedUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
 
-// ─── Connect or launch Chrome ───────────────────────────────────────────────
-let browser;
-try {
-	browser = await puppeteer.connect({ browserURL: `http://localhost:${DEBUG_PORT}` });
-	console.error("♻️  Reusing existing Chrome");
-} catch {
-	console.error("🌐 Launching Chrome…");
-	browser = await puppeteer.launch({
-		headless: false,
+// ─── Clear stale singleton locks ─────────────────────────────────────────────
+// Checks the PID in SingletonLock — if the process is gone, removes all three
+// singleton files so Chrome can start fresh.
+function clearStaleLocks(profileDir) {
+	const lockPath = join(profileDir, "SingletonLock");
+	if (!existsSync(lockPath)) return; // no lock at all, nothing to do
+
+	// Read the PID from the symlink target (format: "hostname-PID")
+	try {
+		const target = readlinkSync(lockPath);
+		const pid    = target.split("-").pop();
+		try {
+			execSync(`kill -0 ${pid}`, { stdio: "ignore" });
+			console.error(`⚠️  Chrome (PID ${pid}) is still running on the pi-chrome-profile — reusing it`);
+			return; // process alive — don't touch anything
+		} catch { /* process gone — safe to clean up */ }
+	} catch { /* can't read symlink — treat as stale */ }
+
+	// Process is dead — remove all three singleton files
+	for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+		const p = join(profileDir, name);
+		try { rmSync(p, { force: true }); console.error(`🧹 Removed stale ${name}`); }
+		catch { /* ignore */ }
+	}
+}
+
+// ─── Launch helper (retries once with a wiped profile on crash) ─────────────
+async function launchChrome() {
+	const opts = {
+		headless: false,   // bundled Chrome for Testing — separate from system Chrome
 		args: [
 			`--remote-debugging-port=${DEBUG_PORT}`,
 			`--user-data-dir=${PROFILE_DIR}`,
 			"--no-first-run",
 			"--no-default-browser-check",
 		],
-	});
+	};
+	try {
+		return await puppeteer.launch(opts);
+	} catch (err) {
+		// Profile may be corrupt/incompatible — wipe it and try once more
+		console.error("⚠️  Chrome failed to launch, wiping profile and retrying…");
+		rmSync(PROFILE_DIR, { recursive: true, force: true });
+		return await puppeteer.launch(opts);
+	}
+}
+
+// ─── Connect or launch Chrome ────────────────────────────────────────────────
+let browser;
+try {
+	browser = await puppeteer.connect({ browserURL: `http://localhost:${DEBUG_PORT}` });
+	console.error("♻️  Reusing existing Chrome");
+} catch {
+	clearStaleLocks(PROFILE_DIR);
+	console.error("🌐 Launching Chrome…");
+	browser = await launchChrome();
 }
 
 const page = await browser.newPage();
@@ -82,7 +124,7 @@ const totalWait = Math.max(1500, waitMs);
 if (waitMs > 0) console.error(`⏱️  Waiting ${waitMs/1000}s for JS to render…`);
 await new Promise(r => setTimeout(r, totalWait));
 
-// ─── Extract content ─────────────────────────────────────────────────────────
+// ─── Extract content ──────────────────────────────────────────────────────────
 const result = await page.evaluate((textOnly) => {
 	const pageTitle = document.title || "";
 	const pageUrl   = window.location.href;
